@@ -9,6 +9,7 @@ def parse_input(file_path: str):
     Routes to the appropriate parser based on file extension:
       .pdf  → parser.pdf.parser.parse_pdf()  → list[ParsedBarData]
       .txt  → legacy text parser             → list[Beam]
+      Both paths return list[Beam], ready for validation and calculation
 
     NOTE: The PDF path currently returns list[ParsedBarData].
     A ParsedBarData → Beam converter (step 3) will be added next,
@@ -27,10 +28,11 @@ def parse_input(file_path: str):
 
 
 def _parse_pdf(file_path: str):
-    """Delegates to the PDF parsing pipeline."""
+    """Delegates to the PDF parsing pipeline, returns list[Beam]."""
     from parser.pdf.parser import parse_pdf
-    return parse_pdf(file_path)
-
+    from parser.pdf.beam_converter import convert_to_beams
+    parsed_bars = parse_pdf(file_path)
+    return convert_to_beams(parsed_bars)
 
 def _parse_txt(file_path: str):
     """Legacy path: reads plain text and builds a single Beam."""
