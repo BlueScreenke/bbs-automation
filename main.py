@@ -1,107 +1,43 @@
-# main.py
+"""
+main.py
 
-from parser import parse_input
-from validation.beam_validator import validate_beam
+Runs the full pipeline: PDF -> parsed callouts -> beams -> Excel BBS.
 
-from calculation.project_calculator import calculate_project
-from calculation.diameter_grouper import group_by_diameter
-from calculation.cutting_list import generate_cutting_list
+Usage:
+    python main.py path/to/drawing.pdf [output/bbs.xlsx]
+"""
 
+from __future__ import annotations
+
+import sys
+
+from parser.pdf import parse_pdf
+from parser.pdf.beam_converter import convert_to_beams
 from export.excel_exporter import export_to_excel
 
 
-def prepare_cutting_data(results):
-    """
-    Prepares cutting list input grouped by diameter.
-    Returns:
-        {
-            diameter: [(length_each, quantity), ...]
-        }
-    """
-    diameter_bars = {}
+def main() -> None:
+    if len(sys.argv) < 2:
+        print("Usage: python main.py path/to/drawing.pdf [output/bbs.xlsx]")
+        sys.exit(1)
 
-    for beam in results["beams"]:
-        for bar in beam["bars"]:
-            dia = bar["diameter"]
-            diameter_bars.setdefault(dia, [])
-            diameter_bars[dia].append(
-                (bar["length_each"], bar["quantity"])
-            )
+    pdf_path    = sys.argv[1]
+    output_path = sys.argv[2] if len(sys.argv) > 2 else "output/bbs.xlsx"
 
-    return diameter_bars
+    print(f"Parsing {pdf_path} ...")
+    parsed_bars = parse_pdf(pdf_path)
+    print(f"  {len(parsed_bars)} bar occurrences parsed")
 
+    matched  = [b for b in parsed_bars if b.match_method not in ("unmatched", "no_outline")]
+    resolved = [b for b in parsed_bars if b.shape_code is not None]
+    print(f"  {len(matched)} matched to geometry, {len(resolved)} with a resolved shape")
 
-def main():
-    # -----------------------------
-    # 1. PARSE INPUT
-    # -----------------------------
-    input_file = "input/sample.txt"   # adjust if needed
-    beams = parse_input(input_file)
+    beams = convert_to_beams(parsed_bars)
+    n_bars_in_beams = sum(len(b.bars) for b in beams)
+    print(f"  {len(beams)} beams, {n_bars_in_beams} bars carried into the BBS")
 
-    # -----------------------------
-    # 2. VALIDATION
-    # -----------------------------
-    errors = []
-    for beam in beams:
-        errors.extend(validate_beam(beam))
-
-    if errors:
-        print("\nVALIDATION FAILED ❌")
-        for err in errors:
-            print(err)
-        return
-
-    print("VALIDATION PASSED ✅")
-
-    # -----------------------------
-    # 3. CALCULATION
-    # -----------------------------
-    results = calculate_project(beams)
-
-    print(f"\nTOTAL PROJECT STEEL: {results['project_total_weight']} kg")
-
-    # -----------------------------
-    # 4. GROUP BY DIAMETER
-    # -----------------------------
-    diameter_summary = group_by_diameter(results)
-
-    print("\nSTEEL SUMMARY BY DIAMETER")
-    for dia, data in diameter_summary.items():
-        print(
-            f"Ø{dia} mm → "
-            f"{data['total_length']} m | "
-            f"{data['total_weight']} kg"
-        )
-
-    # -----------------------------
-    # 5. CUTTING LIST
-    # -----------------------------
-    cutting_data = prepare_cutting_data(results)
-
-    for dia, bars in cutting_data.items():
-        cutting = generate_cutting_list(
-            bars=bars,
-            stock_length=12.0
-        )
-
-        print(f"\nCUTTING LIST – Ø{dia} mm")
-        print(f"Stock bars required: {cutting['stock_bars_required']}")
-        print(f"Total waste: {cutting['total_waste']} m")
-
-        for i, pattern in enumerate(cutting["patterns"], start=1):
-            print(
-                f" Stock {i}: "
-                f"cuts={pattern['cuts']} | "
-                f"waste={pattern['waste']} m"
-            )
-
-    # -----------------------------
-    # 6. EXCEL EXPORT
-    # -----------------------------
-    output_path = "output/bbs.xlsx"
-    export_to_excel(results, output_path)
-
-    print(f"\nBBS EXPORTED SUCCESSFULLY → {output_path} ✅")
+    export_to_excel(beams, output_path)
+    print(f"BBS exported -> {output_path}")
 
 
 if __name__ == "__main__":

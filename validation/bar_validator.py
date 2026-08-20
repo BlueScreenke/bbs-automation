@@ -18,7 +18,17 @@ def validate_bar(bar):
             )
         )
 
-    if bar.length <= 0:
+    # Guard against None before numeric comparison —
+    # length=None means geometric extraction failed; it should have been
+    # caught in beam_converter but is handled here as a safety net.
+    if bar.length is None:
+        errors.append(
+            ValidationError(
+                f"Bar {bar.mark}",
+                "Length is None — bar was not filtered by beam_converter"
+            )
+        )
+    elif bar.length <= 0:
         errors.append(
             ValidationError(
                 f"Bar {bar.mark}",
