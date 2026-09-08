@@ -147,6 +147,51 @@ ORIENTATION_SEARCH_PAD      = 0.0
 
 OUTLINE_Y_TOLERANCE = 3.0
 
+# Non-reinforcement CAD layers to exclude from bar candidacy (replaces
+# an earlier, position-based "outline edge duplicate" heuristic this
+# session — see git history / handoff notes for why that was reverted:
+# it correctly fixed MBM 22 but its safe, tight tolerance didn't
+# generalize to other pages where the same artifact sits at a different
+# offset, and a looser tolerance was confirmed to wrongly exclude
+# genuine reinforcement on unrelated beams, e.g. 1BM 36/2BM 36).
+#
+# This drawing's own PDF layer metadata is a far more precise signal:
+# every line PyMuPDF returns carries the CAD layer it was drawn on
+# (LineSegment.layer). Confirmed identical layer set present on both
+# Page_1_beams.pdf and Beams_bondo.pdf: 'Rebar Line', 'Top Rebar Line',
+# 'Link Line', and 'Rebar Kink' are the genuine reinforcement layers;
+# 'Beam Line(D)' and 'Front Elevation Line' are the beam's own outline/
+# elevation geometry, colour-agnostic and (confirmed, MBM 22) capable
+# of coincidentally sitting close enough to a real bar row to be picked
+# up as a bar candidate. Excluding candidates on these two outline
+# layers directly, using the drawing's own semantic tagging rather than
+# any inferred position, precisely and safely resolves MBM 22's mark 76
+# ~17m phantom without the collateral risk the geometric approach had.
+#
+# NOTE: this does NOT resolve every implausible-length case. Confirmed
+# real case: 1BM 07 mark 83 / 2BM 07 mark 113's own phantom line is
+# ITSELF tagged 'Top Rebar Line' — the same layer as genuine
+# reinforcement — so no layer-based rule can distinguish it; per the
+# project owner's own review of the rendered drawing, this specific
+# artifact is suspected to be a genuine drafting error (a stray/
+# leftover line on the correct layer), not a mis-tagged non-rebar
+# element. See MAX_PLAUSIBLE_BAR_LENGTH_MM below, which is what
+# actually catches this remaining class of case — safely, by flagging
+# the output rather than guessing at which raw line to delete.
+NON_REBAR_LAYERS = {"Beam Line(D)", "Front Elevation Line"}
+
+# Backstop for implausible lengths that survive both the annotation/
+# dimension-artifact exclusions above and the layer exclusion (e.g.
+# 1BM 07 mark 83, 2BM 07 mark 113 — see NON_REBAR_LAYERS docstring).
+# Standard reinforcing bar stock length is ~12m; anything past that
+# physically cannot be a single uncut bar. Deliberately NOT used to
+# delete or reclassify geometry — only to flag the resulting
+# BarLengthResult for manual review (see length_calculator.py), per the
+# project owner's own explicit instruction: differentiate genuine bars
+# from suspicious ones by flagging, never by silently guessing which
+# geometry to discard.
+MAX_PLAUSIBLE_BAR_LENGTH_MM = 12500.0
+
 ANNOTATION_MARKER_MAX_SIZE   = 12.0
 ANNOTATION_MARKER_SEARCH_TOL = 8.0
 ANNOTATION_MARKER_Y_TOLERANCE = 2.5
@@ -174,6 +219,39 @@ CURTAIL_OUTLINE_MARGIN = 2.0
 LAP_Y_TOL           = 0.5
 LAP_SEARCH_MAX_X    = 150.0
 LAP_GAP_CHECK_Y_TOL = 3.0
+
+# "Bend-style" lap tail (confirmed this session, domain knowledge from
+# the project owner). Some laps on this drawing are shown not as a
+# plain end + tick mark (see the tick-mark convention: MBM 04 mark
+# 20/23, a large undimensioned gap with no connecting geometry at all)
+# but as the SAME bar's own line bending very slightly at the splice —
+# the same 0.5-3.0pt shift signature as a genuine two-bar lap — and
+# continuing a short, FIXED-length distance (confirmed page-wide: every
+# instance is 78.4-101.6pt regardless of bar diameter, so this length
+# is a symbolic drafting convention, not the true BS8666 lap length
+# drawn to scale) that sits fully nested inside the NEXT bar's own,
+# separately-drawn, much longer line.
+#
+# Confirmed directly by the project owner: this bend and the tick-mark
+# convention represent the exact same lap principle, just drawn two
+# different ways for on-site clarity — not two independently spliced
+# bars. Cross-validated against real geometry: MBM 04 mark 20 (tick-
+# mark style) and MBM 05 mark 20 (bend style) are the same bar in the
+# same structural location, and their drawn endpoints land within 5pt
+# of each other (531.9pt vs 536.9pt) once this short tail is included —
+# confirming the tail belongs to the UPSTREAM bar's own PhysicalBar,
+# not to a second, separately-numbered bar.
+#
+# Measured page-wide (33 confirmed instances across MBM 04/05/07/08/
+# 14/15/16/17/18): the nested/host fragment always sits within
+# BEND_TAIL_HOST_Y_TOL of the UPSTREAM fragment's own (unshifted) y —
+# never the short tail's shifted y — and is always at least 2x the
+# short tail's own length, with at least 85% of the tail's length
+# falling inside the host's x-range.
+BEND_TAIL_MAX_LENGTH            = 110.0
+BEND_TAIL_HOST_MIN_LENGTH_RATIO = 2.0
+BEND_TAIL_NEST_OVERLAP_FRACTION = 0.85
+BEND_TAIL_HOST_Y_TOL            = 0.5
 
 LAP_DIM_X_FIT_MARGIN = 15.0
 LAP_DIM_Y_MARGIN     = 15.0
@@ -359,7 +437,9 @@ def detect_bars(
         ]
 
         for line in black_candidates:
-            if _is_annotation_terminated(line, all_tick_marks, valid_triangles):
+            if line.layer in NON_REBAR_LAYERS:
+                geometry.excluded_lines.append(line)
+            elif _is_annotation_terminated(line, all_tick_marks, valid_triangles):
                 geometry.excluded_lines.append(line)
             elif numeric_words and _is_dimension_line_artifact(line, numeric_words, primitives):
                 geometry.excluded_lines.append(line)
@@ -442,6 +522,57 @@ def _dedupe_fragments(bar_lines: list[LineSegment]) -> list[LineSegment]:
     return [l for idx, l in enumerate(bar_lines) if idx not in dropped]
 
 
+def _is_bend_style_tail(short_idx: int, upstream_idx: int, bar_lines: list[LineSegment]) -> bool:
+    """
+    True if bar_lines[short_idx] is a bend-style lap tail belonging to
+    bar_lines[upstream_idx]'s own bar, rather than the start of a
+    genuinely separate, second spliced bar. See BEND_TAIL_* constants
+    for the empirical basis (33 confirmed instances page-wide).
+
+    The preferred test: bar_lines[short_idx] must be short, and must
+    sit (mostly) nested inside a THIRD fragment — not upstream_idx
+    itself — that is both much longer and sits at upstream_idx's own
+    (unshifted) y, not at short_idx's shifted y. That third fragment is
+    the NEXT bar's own separately-drawn line; short_idx is just
+    upstream_idx's own tail drawn slightly offset from it for visual
+    clarity at the overlap.
+
+    Fallback (added this session, on Beams_bondo.pdf): no qualifying
+    third-fragment host may exist at all — confirmed real case, MBM 22
+    mark 74's own tail, once NON_REBAR_LAYERS correctly excludes the
+    beam's own outline duplicate that used to coincidentally serve as
+    the "host" for confirmation here. Absent a host, the short
+    fragment's length relative to its connector-shift partner is still
+    a reliable signal on its own: every genuinely separate,
+    independently-labelled bar confirmed anywhere on this drawing is
+    far longer than BEND_TAIL_MAX_LENGTH (300pt+) — nothing this short,
+    connected via a lap-range shift to a much longer fragment, has ever
+    been found to carry its own independent callout.
+    """
+    short    = bar_lines[short_idx]
+    upstream = bar_lines[upstream_idx]
+    if short.length > BEND_TAIL_MAX_LENGTH:
+        return False
+
+    for host_idx, host in enumerate(bar_lines):
+        if host_idx in (short_idx, upstream_idx):
+            continue
+        if host.length < short.length * BEND_TAIL_HOST_MIN_LENGTH_RATIO:
+            continue
+        if abs(host.mid_y - upstream.mid_y) > BEND_TAIL_HOST_Y_TOL:
+            continue
+        overlap = min(short.x_right, host.x_right) - max(short.x_left, host.x_left)
+        if overlap <= 0:
+            continue
+        if overlap / short.length >= BEND_TAIL_NEST_OVERLAP_FRACTION:
+            return True
+
+    if upstream.length >= short.length * BEND_TAIL_HOST_MIN_LENGTH_RATIO:
+        return True
+
+    return False
+
+
 # ── Assembly: fragments -> PhysicalBar ────────────────────────────────────────
 
 def _assemble_physical_bars(
@@ -486,6 +617,25 @@ def _assemble_physical_bars(
     for cl in primitives.lines:
         if cl.length > CONNECTOR_MAX_LENGTH:
             continue
+        # Confirmed real case (1BM 07 mark 83 / 2BM 07 mark 113,
+        # Beams_bondo.pdf): a short line tagged "Front Elevation Line"
+        # (the beam's own outline/elevation geometry, not reinforcement)
+        # happened to sit within CONNECTOR_TOUCH_TOL of two unrelated
+        # bar fragments' own endpoints, at ~0.0pt shift — read as a
+        # genuine TRUE_CONTINUATION and wrongly welding two distinct,
+        # unrelated fragments into one ~1050pt PhysicalBar (⇒ an
+        # implausible ~19.2m length once scaled). This is the exact
+        # same class of problem NON_REBAR_LAYERS already solves for
+        # bar-line *candidacy* (see that constant's own docstring) —
+        # applied here to the separate connector search, which read
+        # every primitive line regardless of layer. Verified page-wide
+        # across both fixtures: exactly these two cases exist, zero
+        # legitimate continuation/lap connector anywhere uses a
+        # NON_REBAR_LAYERS layer, so this exclusion is both necessary
+        # and safe (confirmed zero regressions on Page_1_beams.pdf,
+        # which has no non-rebar-layer connector candidates at all).
+        if cl.layer in NON_REBAR_LAYERS:
+            continue
         owner_a = nearest_owner(cl.start)
         owner_b = nearest_owner(cl.end)
         if owner_a is None or owner_b is None:
@@ -501,7 +651,21 @@ def _assemble_physical_bars(
 
         if shift <= TRUE_CONTINUATION_MAX_SHIFT:
             union(ai, bi)
-        elif LAP_SHIFT_MIN <= shift <= LAP_SHIFT_MAX:
+            continue
+
+        if LAP_SHIFT_MIN <= shift <= LAP_SHIFT_MAX:
+            # Bend-style tail check (see BEND_TAIL_* constants above) —
+            # before treating this shift as a genuine two-bar lap
+            # splice, check whether either side is really just the
+            # OTHER side's own short bend-tail continuation, nested
+            # inside a separate, much longer fragment. If so this is
+            # ONE bar with a kink at the lap, not two spliced bars —
+            # merge them the same way a true (~0 shift) continuation
+            # would be merged, rather than creating a lap link.
+            if _is_bend_style_tail(bi, ai, bar_lines) or _is_bend_style_tail(ai, bi, bar_lines):
+                union(ai, bi)
+                continue
+
             dim = _find_lap_dimension(
                 min(point_a.x, point_b.x) - 1.0, max(point_a.x, point_b.x) + 1.0,
                 (ay + by) / 2, dimension_matches,
@@ -813,6 +977,7 @@ def _find_leader_shafts(
     y_top:     float,
     y_bot:     float,
     margin:    float = LEADER_SHAFT_Y_MARGIN,
+    x_margin:  float = 0.0,
 ) -> list[Polyline]:
     """
     margin defaults to the module constant, so every existing call site
@@ -824,6 +989,17 @@ def _find_leader_shafts(
     which shafts qualify page-wide and create new ambiguity between
     competing candidates near unrelated labels (regression confirmed:
     6 unmatched became 54 with a global bump from 3.0 to 4.0).
+
+    x_margin (added for Beams_bondo.pdf's multi-page drawing set):
+    same opt-in-only pattern as margin above, but widens the box's own
+    x_left/x_right bounds instead of the y-band. Confirmed real case:
+    1BM 23 mark 27, a support bar at the beam's own last column —
+    its leader shaft's centre-x sits ~4.9pt past the box's own x_right
+    (which already includes outline_detector's TEXT_X_MARGIN padding),
+    just outside the beam's own detected outline at that edge. Defaults
+    to 0.0 (no widening) so every existing call site is unaffected;
+    bar_matcher only passes a non-zero value in its own last-resort
+    retry pass, scoped the same way the y-margin retry already is.
     """
     result = []
     for p in polylines:
@@ -834,7 +1010,7 @@ def _find_leader_shafts(
         if width > LEADER_SHAFT_MAX_SIZE or height > LEADER_SHAFT_MAX_SIZE:
             continue
         cx = (bb[0] + bb[2]) / 2
-        if not (box['x_left'] <= cx <= box['x_right']):
+        if not (box['x_left'] - x_margin <= cx <= box['x_right'] + x_margin):
             continue
         touches_band  = bb[1] <= y_bot + margin and bb[3] >= y_top - margin
         extends_past  = bb[1] < y_top - margin or bb[3] > y_bot + margin

@@ -66,48 +66,22 @@ class ParsedBarData:
         "leader_arrow" | "learned_y" | "ordinal" | "leader_arrow_retry"
         | "unmatched" | "no_outline". See bar_matcher.py.
 
-    Shape/length fields (populated by parser.py once length_calculator.py
-    and shape_resolver.py — Step 6D — have run for this bar). Kept flat
-    (plain float/str, not the richer Dimension/BarLengthResult types
-    those modules use internally) deliberately: this module sits below
-    both of them in the import graph (bar_matcher.py imports
-    ParsedBarData from here), so importing their types back into this
-    file would create a circular import. The flat fields below are the
-    full contract those modules promise; nothing is lost by not typing
-    them more richly here.
+    flagged_for_review : bool
+        True if this bar's computed result should be manually checked
+        against the drawing before trusting it — set for two distinct,
+        deliberately conservative reasons (see flag_reason): an
+        implausible length (exceeds standard ~12m rebar stock) or an
+        ambiguous match (two different numeric marks both fell back to
+        the same PhysicalBar, meaning neither's own leader arrow found
+        its true target). Never set for ordinary matched bars, and
+        never used to silently alter a length or shape — purely a
+        downstream review signal (e.g. for Excel export highlighting),
+        per explicit project decision: differentiate genuine bars from
+        suspicious ones by flagging, not by guessing which geometry to
+        discard.
 
-    shape_code : str, optional
-        "00" (straight) | "11" (hooked one end) | "21" (hooked both
-        ends) | "51" (stirrup/link) — office convention, not the literal
-        BS8666:2005 catalogue numbering. See shape_resolver.py.
-
-    length : float, optional
-        For shape "00": the final cutting length in mm. For shape "51"
-        (stirrup): also final — every stirrup dimension is known in
-        Python (see length_calculator.py), so this is
-        dim_a_mm+dim_b_mm+dim_c_mm+dim_d_mm. For shape "11"/"21": this
-        is ONLY the bar's known-in-Python "B" portion, NOT the final
-        cutting length — the hook length(s) that complete the total are
-        deliberately left for the Excel export step to resolve via
-        dim_a_lookup_key/dim_c_lookup_key (see below). Consumers that
-        need a true final total for a hooked bar must wait for that
-        Excel-side sum; this field alone is not it. None if no length
-        could be computed at all (unmatched geometry, or no page scale)
-        — a genuine data gap, not guessed.
-
-    dim_a_mm, dim_b_mm, dim_c_mm, dim_d_mm : float, optional
-        Known-in-Python A/B/C/D dimension values, where applicable for
-        this bar's shape_code. None where that letter isn't used by this
-        shape, AND None (with the matching *_lookup_key set instead)
-        where the value is a hook length deliberately deferred to Excel.
-
-    dim_a_lookup_key, dim_c_lookup_key : str, optional
-        Set only for a hook dimension (shape "11"'s A, shape "21"'s A
-        and C) — e.g. "11_T16". The Excel export step resolves this via
-        INDEX/MATCH against an editable hook-parameter reference sheet,
-        the same pattern the project's reference BBS template already
-        uses. Adjusting a hook length in the future means editing that
-        Excel table, never this code.
+    flag_reason : str, optional
+        Human-readable reason when flagged_for_review is True.
     """
 
     source:       str
@@ -129,13 +103,8 @@ class ParsedBarData:
     lap_length:   Optional[float] = None
     lap_source:   Optional[str] = None
     match_method: Optional[str] = None
-    shape_code:        Optional[str] = None
-    dim_a_mm:           Optional[float] = None
-    dim_b_mm:           Optional[float] = None
-    dim_c_mm:           Optional[float] = None
-    dim_d_mm:           Optional[float] = None
-    dim_a_lookup_key:    Optional[str] = None
-    dim_c_lookup_key:    Optional[str] = None
+    flagged_for_review: bool = False
+    flag_reason:        Optional[str] = None
 
     @property
     def bar_mark(self) -> Optional[str]:

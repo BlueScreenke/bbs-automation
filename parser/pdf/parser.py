@@ -68,7 +68,7 @@ from parser.pdf.dimension_extractor import extract_dimension_matches
 from parser.pdf.length_calculator import calculate_bar_lengths, derive_scale_mm_per_pt
 from parser.geometry.outline_detector import detect_beam_boxes
 from parser.geometry.pdf_line_extractor import extract_page_primitives
-from parser.geometry.bar_detector import detect_bars, BeamBarGeometry
+from parser.geometry.bar_detector import detect_bars, BeamBarGeometry, MAX_PLAUSIBLE_BAR_LENGTH_MM
 from parser.geometry.bar_matcher import match_bars_to_geometry, _unmatched
 from parser.geometry.endpoint_classifier import classify_all, ClassifiedBar
 from parser.geometry.shape_resolver import resolve_shapes
@@ -78,6 +78,13 @@ import pdfplumber
 
 _MAX_MARK_DIGITS = 4
 _SECTION_RE = re.compile(r'\(\d+[xX]\d+', re.I)
+
+# Mirrors outline_detector._MERGED_SECTION_SUFFIX_RE — some beam number
+# labels have their number and cross-section suffix merged into one
+# pdfplumber word with no gap (e.g. "26(200x600mm)"). Needed here too
+# so this function's own sibling-text comparison recognizes the same
+# merged token outline_detector already cleaned up when building beam_id.
+_MERGED_SECTION_SUFFIX_RE = re.compile(r'^([0-9A-Za-z\'\.]+)(\(.*\))$')
 
 # Position-inheritance tolerances (see module docstring, point 1).
 # Confirmed case (MBM 04 marks 24/25): same top to the pixel, x-gap
@@ -89,30 +96,61 @@ POSITION_INHERIT_MAX_X_GAP = 60.0
 
 
 def parse_pdf(path: str) -> list[ParsedBarData]:
+    """
+    Multi-page support: every page runs the full geometry pipeline
+    (beam boxes, dimension matches, bar detection) independently and
+    scoped to its own page — nothing here is hardcoded to page 1
+    anymore. dimension_extractor.extract_dimension_matches() and
+    pdf_line_extractor.extract_page_primitives() both take page_no and
+    only ever read that one page's own drawings/words, so a multi-sheet
+    PDF's pages can never cross-contaminate each other's dimensions or
+    geometry. detect_bars()'s result list stays in the same order as
+    boxes (needed because a beam_id can legitimately appear in more
+    than one zone — e.g. Page_1_beams.pdf's own "MBM 05" duplicate-label
+    quirk — so zone and geometry must be paired by position, never
+    looked up by beam_id).
+    """
     all_results: list[ParsedBarData] = []
     pages_words = extract_words_with_coords(path)
 
     for page_no, words in pages_words.items():
         page_w, page_h = _get_page_dims(path, page_no)
-        primitives    = extract_page_primitives(path, page_no=page_no)
-        boxes         = detect_beam_boxes(words, primitives, page_w, page_h, page_no=page_no)
-        dim_matches   = extract_dimension_matches(path) if page_no == 1 else []
-        scale         = derive_scale_mm_per_pt(dim_matches) if page_no == 1 else None
-        geometries    = detect_bars(primitives, boxes, dim_matches) if page_no == 1 else [None] * len(boxes)
+        primitives     = extract_page_primitives(path, page_no=page_no)
+        boxes          = detect_beam_boxes(words, primitives, page_w, page_h, page_no=page_no)
+        dim_matches    = extract_dimension_matches(path, page_no=page_no)
+        fallback_scale = derive_scale_mm_per_pt(dim_matches)
+        geometries     = detect_bars(primitives, boxes, dim_matches)
 
         for box, geometry in zip(boxes, geometries):
-            beam_results = _process_beam_zone(words, box, geometry, primitives, scale)
+            zone_dims = _dims_in_zone(dim_matches, box)
+            beam_results = _process_beam_zone(words, box, geometry, primitives, zone_dims, fallback_scale)
             all_results.extend(beam_results)
 
     return all_results
 
 
+def _dims_in_zone(dim_matches: list[dict], box: dict) -> list[dict]:
+    """
+    This beam's own drawn dimension matches — same box-zone filter
+    dimension_extractor._assign_dims_to_beams() uses, kept here too
+    since length_calculator.py now needs the raw {value, y, x_left,
+    x_right} matches (for its dimension-chain search and local scale),
+    not the flattened all_dims/span_dims summary that function returns.
+    """
+    return [
+        m for m in dim_matches
+        if box['x_left'] < (m['x_left'] + m['x_right']) / 2 < box['x_right']
+        and box['y_top'] < m['y'] < box['y_bot']
+    ]
+
+
 def _process_beam_zone(
-    words:      list[dict],
-    box:        dict,
-    geometry:   Optional[BeamBarGeometry],
-    primitives: PagePrimitives,
-    scale_mm_per_pt: Optional[float],
+    words:            list[dict],
+    box:              dict,
+    geometry:         Optional[BeamBarGeometry],
+    primitives:       PagePrimitives,
+    zone_dims:        list[dict],
+    fallback_scale:   Optional[float],
 ) -> list[ParsedBarData]:
 
     beam_id    = box['id']
@@ -157,7 +195,7 @@ def _process_beam_zone(
     # mistake caused last session.
     classified_for_bars = [classified_by_id[id(b)] for b in bars]
 
-    length_results = calculate_bar_lengths(classified_for_bars, beam_label, scale_mm_per_pt)
+    length_results = calculate_bar_lengths(classified_for_bars, beam_label, zone_dims, fallback_scale)
     shape_results   = resolve_shapes(classified_for_bars, length_results)
 
     for bar, lr, sr in zip(bars, length_results, shape_results):
@@ -167,6 +205,15 @@ def _process_beam_zone(
             bar.length = sum(legs) + 2 * lr.stirrup_tail_mm if all(v is not None for v in legs) else None
         else:
             bar.length = lr.straight_length_mm
+            if bar.length is not None and bar.length > MAX_PLAUSIBLE_BAR_LENGTH_MM:
+                bar.flagged_for_review = True
+                reason = (
+                    f"implausible length: {bar.length:.0f}mm exceeds standard "
+                    f"reinforcing bar stock length (~12m) — this bar's own "
+                    f"matched geometry likely includes a mis-assembled or "
+                    f"phantom segment; verify against the drawing before use"
+                )
+                bar.flag_reason = f"{bar.flag_reason}; {reason}" if bar.flag_reason else reason
 
         dim_a = sr.dimensions.get("A")
         dim_b = sr.dimensions.get("B")
@@ -253,6 +300,16 @@ def _attach_geometry_classification(
         bar.hook_count   = c.hook_count
         bar.is_lapped    = c.is_lapped
 
+        if c.matched_bar.ambiguous_shared_bar:
+            bar.flagged_for_review = True
+            bar.flag_reason = (
+                "ambiguous match: this mark shares its matched PhysicalBar "
+                "with at least one other, differently-numbered mark in this "
+                "beam via a fallback (non-leader-arrow) match — neither "
+                "mark's own leader arrow found its true target geometry; "
+                "verify against the drawing"
+            )
+
         lap_ends = [e for e in (c.left_end, c.right_end) if e.is_lap]
         if lap_ends:
             # Both ends lapped is rare but possible in principle — prefer
@@ -319,15 +376,33 @@ def _word_in_box(word: dict, box: dict) -> bool:
 
 
 def _find_beam_label(all_words: list[dict], beam_id: str) -> str:
-    beam_num = beam_id.split(' ', 1)[-1]
+    """
+    Finds the full label (with cross-section dims, e.g. "MBM 05
+    (200x600mm)") for a given beam_id.
+
+    Generalized this session (see outline_detector._BEAM_MARK_PREFIX_RE):
+    beam_id's own prefix (the part before the first space — "MBM",
+    "1BM", "2BM", "SBM", ...) is used directly instead of a hardcoded
+    "MBM" literal, so this matches whichever prefix convention the
+    beam_id was actually built from. Confirmed necessary on
+    Beams_bondo.pdf, which uses four different prefixes across its six
+    sheets.
+    """
+    prefix, _, beam_num = beam_id.partition(' ')
     anchor = None
     for w in all_words:
-        if w['text'] == 'MBM':
+        if w['text'] == prefix:
             siblings = sorted(
                 [x for x in all_words if abs(x['top']-w['top']) < 6 and x['x0'] > w['x0']],
                 key=lambda x: x['x0'],
             )
-            if siblings and siblings[0]['text'] == beam_num:
+            if not siblings:
+                continue
+            sib_text = siblings[0]['text']
+            m = _MERGED_SECTION_SUFFIX_RE.match(sib_text)
+            if m:
+                sib_text = m.group(1)
+            if sib_text == beam_num:
                 anchor = w
                 break
 
@@ -338,7 +413,14 @@ def _find_beam_label(all_words: list[dict], beam_id: str) -> str:
     for w in all_words:
         if abs(float(w['top']) - ay) < 12 and abs(float(w['x0']) - ax) < 600:
             if _SECTION_RE.search(w['text']):
-                return f"{beam_id} {w['text']}"
+                text = w['text']
+                m2 = _MERGED_SECTION_SUFFIX_RE.match(text)
+                if m2:
+                    # e.g. "26(200x600mm)" -> just "(200x600mm)", so the
+                    # returned label doesn't duplicate the beam number
+                    # ("MBM 26 26(200x600mm)").
+                    text = m2.group(2)
+                return f"{beam_id} {text}"
 
     return beam_id
 

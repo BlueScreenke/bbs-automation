@@ -65,9 +65,10 @@ def extract_page_primitives(pdf_path: str, page_no: int = 1) -> PagePrimitives:
     for drawing in page.get_drawings():
         stroke = Colour.from_tuple(drawing.get("color"))
         fill   = Colour.from_tuple(drawing.get("fill"))
+        layer  = drawing.get("layer")
         items  = drawing["items"]
 
-        _process_drawing(items, stroke, fill, result)
+        _process_drawing(items, stroke, fill, layer, result)
 
     return result
 
@@ -92,6 +93,7 @@ def _process_drawing(
     items:  list,
     stroke: Optional[Colour],
     fill:   Optional[Colour],
+    layer:  Optional[str],
     result: PagePrimitives,
 ) -> None:
     """
@@ -103,13 +105,22 @@ def _process_drawing(
     - 1 item, type 'qu' → CubicBezier (quadratic approximated as cubic)
     - 2+ items, all 'l' → Polyline
     - 2+ items, mixed   → decompose into individual LineSegments/CubicBeziers
+
+    layer (added this session): PyMuPDF's own CAD layer name for this
+    drawing (e.g. "Rebar Line", "Beam Line(D)", "Front Elevation Line")
+    — confirmed present and consistent across every drawing tested so
+    far. Only threaded through to LineSegment (via _make_line) since
+    that's the only primitive type bar_detector.py currently needs it
+    for (distinguishing genuine reinforcement from the beam's own
+    outline geometry, which can otherwise coincidentally sit close
+    enough to a real bar row to be picked up as a bar candidate).
     """
     if not items:
         return
 
     # Single straight line
     if len(items) == 1 and items[0][0] == 'l':
-        seg = _make_line(items[0], stroke, fill)
+        seg = _make_line(items[0], stroke, fill, layer)
         if seg:
             result.lines.append(seg)
         return
@@ -146,7 +157,7 @@ def _process_drawing(
     # Mixed path: decompose each item individually
     for item in items:
         if item[0] == 'l':
-            seg = _make_line(item, stroke, fill)
+            seg = _make_line(item, stroke, fill, layer)
             if seg:
                 result.lines.append(seg)
         elif item[0] == 'c':
@@ -165,6 +176,7 @@ def _make_line(
     item:   tuple,
     stroke: Optional[Colour],
     fill:   Optional[Colour],
+    layer:  Optional[str] = None,
 ) -> Optional[LineSegment]:
     """Build a LineSegment from a PyMuPDF 'l' item."""
     # item format: ('l', Point, Point)
@@ -175,6 +187,7 @@ def _make_line(
             end=Point(float(p2.x), float(p2.y)),
             stroke=stroke,
             fill=fill,
+            layer=layer,
         )
     except (ValueError, IndexError, AttributeError):
         return None

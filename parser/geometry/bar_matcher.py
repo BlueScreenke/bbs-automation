@@ -130,6 +130,20 @@ LEARNED_Y_CLUSTER_TOL = 2.0
 # entirely, since a callout matched earlier never reaches this pass.
 RETRY_SHAFT_Y_MARGIN = 1.5
 
+# Last-resort retry margin for pass 4 (see module docstring "Pass 4").
+# Added for Beams_bondo.pdf's multi-page drawing set. Widens the box's
+# own x_left/x_right bounds (not y) when searching for a leader shaft —
+# unlike RETRY_SHAFT_Y_MARGIN, larger is more permissive here (a
+# straightforward widening of the box, no inverted-direction subtlety).
+# Confirmed real case: 1BM 23 mark 27, a support bar at the beam's own
+# last column — its leader shaft's centre-x sits ~4.9pt past the box's
+# own x_right (which already includes outline_detector's own
+# TEXT_X_MARGIN padding). 10.0pt clears that with margin. Scoped the
+# same way as RETRY_SHAFT_Y_MARGIN: only tried after passes 1-3 (plain
+# match, learned-y/ordinal, wider y-margin) have all already failed, so
+# it cannot regress an already-successful match.
+RETRY_SHAFT_X_MARGIN = 10.0
+
 # Ordinal fallback ranks, used only when a label was never confidently
 # matched anywhere in the beam. Lower rank = nearer the outline's top.
 _ORDINAL_MAX_LAYER = 9
@@ -149,9 +163,10 @@ class MatchedBar:
     top:               float
     physical_bar:      Optional[PhysicalBar]
     matched_fragment:  Optional[LineSegment]   # the specific raw fragment the arrow/learned-y landed on, kept for traceability
-    match_method:      str   # "leader_arrow" | "learned_y" | "ordinal" | "leader_arrow_retry" | "unmatched"
+    match_method:      str   # "leader_arrow" | "learned_y" | "ordinal" | "leader_arrow_retry" | "leader_arrow_retry_x" | "unmatched"
     is_duplicate_mark: bool  # True if this numeric_mark has more than one occurrence in this beam
     source:            ParsedBarData
+    ambiguous_shared_bar: bool = False  # see _flag_ambiguous_shared_matches
 
     def summary(self) -> str:
         bar_desc = (
@@ -161,7 +176,8 @@ class MatchedBar:
         )
         return (
             f"MatchedBar(mark={self.numeric_mark!r}, position={self.position!r}, "
-            f"bar={bar_desc}, method={self.match_method!r}, dup={self.is_duplicate_mark})"
+            f"bar={bar_desc}, method={self.match_method!r}, dup={self.is_duplicate_mark}, "
+            f"ambiguous={self.ambiguous_shared_bar})"
         )
 
 
@@ -232,6 +248,7 @@ def match_bars_to_geometry(
     # to callouts passes 1-2 already failed on (see RETRY_SHAFT_Y_MARGIN
     # — this cannot regress an already-successful match, since anything
     # matched in pass 1 or 2 never reaches here).
+    still_unresolved_after_y_retry: list[tuple[int, ParsedBarData]] = []
     if still_unresolved:
         loose_shafts = _find_leader_shafts(
             primitives.polylines, geometry.box, geometry.outline_y_top, geometry.outline_y_bottom,
@@ -241,6 +258,25 @@ def match_bars_to_geometry(
             line = _match_via_leader_arrow(p, loose_shafts, geometry.bar_lines, geometry.outline_y_top, geometry.outline_y_bottom)
             if line is not None:
                 results_by_index[i] = _make_match(p, geometry.beam_id, line, frag_owner, "leader_arrow_retry", mark_counts)
+            else:
+                still_unresolved_after_y_retry.append((i, p))
+
+    # Pass 4: leader-arrow retry with a wider shaft x-margin (see
+    # RETRY_SHAFT_X_MARGIN), scoped ONLY to callouts passes 1-3 already
+    # failed on. Covers a callout sitting near the beam's own end
+    # column, whose own leader shaft falls just outside the box's own
+    # x-bounds (even after outline_detector's existing TEXT_X_MARGIN
+    # padding) — a different failure mode from the y-margin case above,
+    # so tried as its own separate retry rather than folded into pass 3.
+    if still_unresolved_after_y_retry:
+        wide_x_shafts = _find_leader_shafts(
+            primitives.polylines, geometry.box, geometry.outline_y_top, geometry.outline_y_bottom,
+            margin=RETRY_SHAFT_Y_MARGIN, x_margin=RETRY_SHAFT_X_MARGIN,
+        )
+        for i, p in still_unresolved_after_y_retry:
+            line = _match_via_leader_arrow(p, wide_x_shafts, geometry.bar_lines, geometry.outline_y_top, geometry.outline_y_bottom)
+            if line is not None:
+                results_by_index[i] = _make_match(p, geometry.beam_id, line, frag_owner, "leader_arrow_retry_x", mark_counts)
             else:
                 results_by_index[i] = _make_match(p, geometry.beam_id, None, frag_owner, "unmatched", mark_counts)
 
@@ -255,7 +291,65 @@ def match_bars_to_geometry(
     # Page_1_beams.pdf (MBM 04): mark 25 failing pass 1 caused mark 22
     # and mark 24's classifications to be read from the wrong MatchedBar
     # entirely, degrading a working match into a false "unmatched".
-    return [results_by_index[i] for i in range(len(parsed_bars))]
+    final = [results_by_index[i] for i in range(len(parsed_bars))]
+    _flag_ambiguous_shared_matches(final)
+    return final
+
+
+def _flag_ambiguous_shared_matches(matches: list[MatchedBar]) -> None:
+    """
+    Sets ambiguous_shared_bar=True (in place) on any match where two or
+    more DIFFERENT numeric marks were resolved, via a fallback pass
+    (anything other than the direct, confident "leader_arrow" match),
+    onto the exact same PhysicalBar.
+
+    Confirmed real case: MBM 22 (Beams_bondo.pdf) marks 76 and 77 —
+    neither has a leader-arrow shaft reaching its own true target
+    (confirmed: no reinforcement geometry at all exists at either
+    callout's own arrow endpoint, a genuine gap in the source drawing
+    this module cannot safely fill in), so both fall through to the
+    learned_y fallback and collide on the same small leftover fragment.
+    This is a fundamentally different situation from a genuine lap
+    chain, where each mark's OWN leader arrow confidently lands on its
+    own distinct geometry (see bar_detector.py's docstring on marks
+    18/22/24) — there, this check never fires, since match_method is
+    "leader_arrow" throughout.
+
+    Stirrup occurrences excluded from grouping (tightened after project
+    owner review, this session). Confirmed real case: several beams
+    (MBM 09, MBM 12, 1BM 10, 2BM 02, 2BM 33, SBM 01) had a main bar and
+    that beam's own T8 stirrup mark both fall back onto the same
+    fragment and get flagged together. Per the project owner's own
+    domain knowledge, this is architecturally meaningless — a stirrup's
+    length comes entirely from the beam's own cross-section
+    (length_calculator._calculate_stirrup), never from which
+    PhysicalBar it happened to match, so a stirrup "colliding" with a
+    main bar's fragment can never indicate a real ambiguity in either
+    one's own computed output. Excluding spacing-bearing (stirrup)
+    occurrences here removes exactly those false positives while
+    leaving genuine main-bar-vs-main-bar collisions (e.g. MBM 22
+    76/77, MBM 27 41/44) flagged, since those never involve a stirrup
+    on either side.
+
+    Deliberately does NOT touch physical_bar, length, or shape — this
+    is purely an honesty flag for downstream review (Excel export can
+    highlight it), per the project owner's own explicit instruction to
+    differentiate genuine bars from suspicious ones by flagging rather
+    than by guessing which geometry is "real".
+    """
+    by_bar: dict[str, list[MatchedBar]] = {}
+    for m in matches:
+        if m.physical_bar is None or m.match_method == "leader_arrow":
+            continue
+        if m.source.spacing is not None:
+            continue
+        by_bar.setdefault(m.physical_bar.id, []).append(m)
+
+    for bar_id, group in by_bar.items():
+        distinct_marks = {m.numeric_mark for m in group}
+        if len(distinct_marks) > 1:
+            for m in group:
+                m.ambiguous_shared_bar = True
 
 
 # ── Fragment -> PhysicalBar lookup ────────────────────────────────────────────

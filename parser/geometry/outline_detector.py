@@ -528,16 +528,45 @@ def _box_from_single_edge(anchor: dict, outline: dict, page_no: int) -> dict:
 
 # ── Tier 3: label-midpoint fallback (ported from retired get_beam_boxes) ──────
 
+# Beam-mark label prefix, generalized this session. Confirmed on
+# Beams_bondo.pdf (6-page drawing set): a single project can use
+# multiple prefixes across different sheets/floor levels — "MBM"
+# (sheet 7), "1BM" (sheets 8-9), "2BM" (sheets 10-11), and "SBM"
+# (sheet 12) were all found, each followed by its own numeric beam
+# label on the same text row exactly like "MBM n". Previously hardcoded
+# to the literal word "MBM", which silently produced zero beam boxes
+# (and therefore zero bars) on every page using a different prefix —
+# confirmed to have dropped pages 3-6 of Beams_bondo.pdf entirely
+# before this fix. Matches 1-2 leading digits/letters + "BM" so a
+# future prefix (e.g. "3BM", "GBM") is picked up without further code
+# changes; still requires the "BM" text to be followed by a numeric-ish
+# sibling on the same row, so unrelated short tokens aren't swept in.
+_BEAM_MARK_PREFIX_RE = re.compile(r'^[0-9A-Z]{1,2}BM$')
+
+# Some beam number labels have their number and cross-section suffix
+# merged into a single pdfplumber word with no gap between them —
+# confirmed on Beams_bondo.pdf ("26(200x600mm)" as one token, unlike
+# the normal "26" + separate "(200x600mm)" tokenization used
+# everywhere else on the same drawing). Split any trailing "(...)" off
+# the leading beam-number portion so the beam_id built from it stays
+# clean ("MBM 26") the same way it would if the two had been separate
+# words to begin with.
+_MERGED_SECTION_SUFFIX_RE = re.compile(r'^([0-9A-Za-z\'\.]+)(\(.*\))$')
+
+
 def _find_mbm_anchors(words: list[dict]) -> list[dict]:
     anchors = []
     for w in words:
-        if w['text'] == 'MBM':
+        if _BEAM_MARK_PREFIX_RE.match(w['text']):
             siblings = sorted(
                 [x for x in words if abs(x['top'] - w['top']) < 6 and x['x0'] > w['x0']],
                 key=lambda x: x['x0'],
             )
             name = siblings[0]['text'] if siblings else '?'
-            anchors.append({'id': f"MBM {name}", 'x': w['x0'], 'y': w['top']})
+            m = _MERGED_SECTION_SUFFIX_RE.match(name)
+            if m:
+                name = m.group(1)
+            anchors.append({'id': f"{w['text']} {name}", 'x': w['x0'], 'y': w['top']})
     anchors.sort(key=lambda a: (a['y'], a['x']))
     return anchors
 

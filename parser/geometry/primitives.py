@@ -78,6 +78,7 @@ class LineSegment:
     end:    Point
     stroke: Optional[Colour] = None
     fill:   Optional[Colour] = None
+    layer:  Optional[str] = None
 
     @property
     def length(self) -> float:
