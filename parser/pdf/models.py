@@ -106,6 +106,27 @@ class ParsedBarData:
     flagged_for_review: bool = False
     flag_reason:        Optional[str] = None
 
+    # Step 6D/6E fields (shape code + A/B/C/D dimension layout — see
+    # parser.geometry.shape_resolver.ShapeResult). parser.py sets these
+    # conditionally, only when shape_resolver actually produced that
+    # particular dimension (e.g. a straight bar, shape 00, only ever
+    # gets dim_a_mm — dim_b/c/d are never set on it at all; only a
+    # stirrup, shape 51, populates all four). Declared here as proper
+    # dataclass fields with a None default so every ParsedBarData
+    # instance has all of them from construction — confirmed real bug
+    # this session: beam_converter.py reads item.dim_d_mm
+    # unconditionally, and without these declared (with defaults) that
+    # attribute simply doesn't exist at all on any non-stirrup bar,
+    # raising AttributeError rather than returning a genuine "no D
+    # dimension for this shape" None.
+    shape_code:        Optional[str] = None
+    dim_a_mm:          Optional[float] = None
+    dim_a_lookup_key:  Optional[str] = None
+    dim_b_mm:          Optional[float] = None
+    dim_c_mm:          Optional[float] = None
+    dim_c_lookup_key:  Optional[str] = None
+    dim_d_mm:          Optional[float] = None
+
     @property
     def bar_mark(self) -> Optional[str]:
         """Backward-compatible alias — returns numeric_mark."""

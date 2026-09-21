@@ -3,7 +3,7 @@ from typing import Optional
 
 
 def parse_diameter(text: str) -> Optional[int]:
-    r"""
+    """
     Matches bar diameter. Supports 1- and 2-digit diameters after T/Y/Ø/D.
     Fixes: previous version required \d{2} which silently dropped T8 bars.
 
@@ -43,6 +43,23 @@ def parse_spacing(text: str) -> Optional[int]:
     return None
 
 
+_BARE_LABEL_QUANTITY_RE = re.compile(r"^(?:[a-zA-Z]=)?(?:Y|Ø|D|T)\d+-")
+
+# "NxMT..." stirrup-count convention (confirmed real case: "16x1T8-300-5"
+# / "21x1T8-300-5", Beams_bondo.pdf — 1BM 29 / 2BM 29's own stirrup
+# line). Confirmed directly by the project owner: the leading number
+# (16, 21) IS the bar's real quantity — the "x1" is a per-group-of-one
+# multiplier, always 1 in every confirmed instance, not a separate
+# count to combine with the leading number. Kept as its own explicit
+# pattern rather than folded into the general leading-quantity regex
+# above: that regex requires the quantity digits to sit DIRECTLY before
+# the bar-type letter (no "x" in between), which is deliberate — a
+# token with digits separated from the bar-type letter by anything
+# unrecognised should stay unparsed (see _BARE_LABEL_QUANTITY_RE's own
+# docstring note) until confirmed, not be guessed at automatically.
+_X_MULTIPLIER_QUANTITY_RE = re.compile(r"^(\d+)x\d+(?:Y|Ø|D|T)\d+")
+
+
 def parse_quantity(text: str) -> Optional[int]:
     """
     Matches bar quantity.
@@ -52,13 +69,33 @@ def parse_quantity(text: str) -> Optional[int]:
         "4 No Y12 bars"     → 4
         "2T16-4(T1)"        → 2
         "16T8-03-300"       → 16
+        "16x1T8-300-5"      → 16  (confirmed "NxM" stirrup convention)
+        "T20-9(B2)"         → 1   (bare, no leading count — see below)
+        "a=T20-44(B1)"      → 1   (cross-section legend label — see below)
+
+    Bare / label-assignment convention (confirmed by the project owner
+    against the rendered drawing, this session): a callout with NO
+    leading quantity digit at all — either a plain bar-type token
+    ("T20-9(B2)") or a cross-section legend assignment ("a=T20-44(B1)",
+    "d=T8-300-2") — always represents exactly one bar. Deliberately
+    narrow: only fires when the bar-type letter is the very first
+    character of the token (optionally preceded by a single-letter
+    label and "="), so a token that DOES carry its own leading digit
+    but isn't recognised by the "NxM" pattern either stays unparsed
+    rather than being silently guessed at.
     """
     match = re.search(r"(\d+)\s?(?:No|nos)\b", text, re.I)
     if match:
         return int(match.group(1))
-    match = re.search(r"^(\d+)(?:Y|Ø|D|T)\d+", text.strip())
+    stripped = text.strip()
+    match = re.search(r"^(\d+)(?:Y|Ø|D|T)\d+", stripped)
     if match:
         return int(match.group(1))
+    match = _X_MULTIPLIER_QUANTITY_RE.match(stripped)
+    if match:
+        return int(match.group(1))
+    if _BARE_LABEL_QUANTITY_RE.match(stripped):
+        return 1
     return None
 
 
