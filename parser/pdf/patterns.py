@@ -26,13 +26,19 @@ def parse_spacing(text: str) -> Optional[int]:
         "Y12 @ 150"         → 150
         "16T8-03-300"       → 300
         "26T8-300-63"       → 300
+        "48x1T8-150-156(T)" → 150   (trailing position marker — see below)
     """
     match = re.search(r"@\s?(\d{2,3})", text)
     if match:
         return int(match.group(1))
 
-    # Dash-separated: two segments after the bar type, one is spacing (mult of 25)
-    m = re.search(r"(?:Y|Ø|D|T)\d+-(\d{1,3})-(\d{1,3})$", text)
+    # Dash-separated: two segments after the bar type, one is spacing (mult of 25).
+    # The optional trailing "(...)" tolerates a stirrup-zone position marker some
+    # drawings append after the dash pair (confirmed: Serenity_beams.dxf/.pdf use
+    # "T8-150-156(T)"/"(B)" for stirrups tied to a specific top/bottom zone,
+    # unlike Beams_bondo's plain "T8-03-300" with no such suffix) — without this,
+    # the pattern silently failed to match at all on that drawing's own stirrups.
+    m = re.search(r"(?:Y|Ø|D|T)\d+-(\d{1,3})-(\d{1,3})(?:\([A-Za-z0-9/]*\))?$", text)
     if m:
         a, b = int(m.group(1)), int(m.group(2))
         if a % 25 == 0 and b % 25 != 0:
@@ -118,8 +124,10 @@ def parse_numeric_mark(text: str) -> Optional[str]:
     if m:
         return m.group(1)
 
-    # Stirrup: NTdd-A-B where one of A/B is the spacing (divisible by 25)
-    m = re.search(r"(?:Y|Ø|D|T)\d+-(\d{1,3})-(\d{1,3})$", text)
+    # Stirrup: NTdd-A-B where one of A/B is the spacing (divisible by 25).
+    # See parse_spacing()'s own note: the optional trailing "(...)" tolerates
+    # a stirrup-zone position marker some drawings append (e.g. "(T)"/"(B)").
+    m = re.search(r"(?:Y|Ø|D|T)\d+-(\d{1,3})-(\d{1,3})(?:\([A-Za-z0-9/]*\))?$", text)
     if m:
         a, b = int(m.group(1)), int(m.group(2))
         if a % 25 == 0 and b % 25 != 0:
