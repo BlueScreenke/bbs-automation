@@ -186,6 +186,8 @@ def calculate_bar_lengths(
     beam_label:        str,
     zone_dims:          list[dict],
     fallback_scale:      Optional[float] = None,
+    boundary_match_tol:  float = BOUNDARY_MATCH_TOL,
+    chain_gap_tol:        float = CHAIN_GAP_TOL,
 ) -> list[BarLengthResult]:
     """
     Calculate length figures for every classified bar occurrence in one
@@ -235,6 +237,20 @@ def calculate_bar_lengths(
                           page-wide) for the rare beam with no
                           dimensions in its own zone at all. None if no
                           page-wide scale could be derived either.
+        boundary_match_tol, chain_gap_tol: override the module's own
+                          PDF-calibrated defaults. Both are in the SAME
+                          units as zone_dims'/physical bars' own x-
+                          coordinates — PDF points for the PDF path,
+                          real millimetres for the DWG path (DXF
+                          coordinates are already 1:1 mm). Confirmed
+                          necessary: reusing the PDF-calibrated 15/30
+                          (point) defaults unchanged against DWG's own
+                          mm-native coordinates made them far tighter
+                          than intended (15mm vs. PDF's own effective
+                          real-world equivalent of roughly 270-300mm, a
+                          15pt tolerance x an 18-20mm/pt local scale).
+                          Defaulting to the PDF path's own exact values
+                          keeps this zero-risk for the PDF path.
 
     Returns:
         One BarLengthResult per input ClassifiedBar, same order.
@@ -265,12 +281,39 @@ def calculate_bar_lengths(
         pb = classified_bars[i].matched_bar.physical_bar
         if pb is None:
             continue
-        coverage = _find_dimension_coverage(pb.x_left, pb.x_right, available)
+        coverage = _find_dimension_coverage(pb.x_left, pb.x_right, available, boundary_match_tol, chain_gap_tol)
         if coverage is not None and coverage['covers_full']:
             full_matches[i] = coverage
             if len(coverage['used']) > 1:
                 claimed_ids = {id(d) for d in coverage['used']}
                 available = [d for d in available if id(d) not in claimed_ids]
+
+    # Pass 1b: a multi-dimension chain just claimed above is usually
+    # bar-specific (see the comment above) — but confirmed real
+    # exception (Serenity_beams.dxf FBM 19 marks 32/33): two DIFFERENT
+    # bars (a T1 and a B1, both hooked both ends) can genuinely share
+    # the exact same chain, each independently running that same full
+    # combined span. Deliberately narrow and additive, so it cannot
+    # change any bar's result from Pass 1 above: only bars Pass 1 did
+    # NOT already fully match are even considered, and a bar is only
+    # upgraded here if ITS OWN geometry, tested against that exact
+    # already-claimed chain in isolation, is itself a full match — this
+    # never alters which chain any bar's own Pass 1 search found, only
+    # whether a second bar may reuse one that (by this independent
+    # check) was never really bar-specific to begin with.
+    for i in main_bar_idxs:
+        if i in full_matches:
+            continue
+        pb = classified_bars[i].matched_bar.physical_bar
+        if pb is None:
+            continue
+        for claimed in full_matches.values():
+            if len(claimed['used']) < 2:
+                continue
+            retry = _find_dimension_coverage(pb.x_left, pb.x_right, claimed['used'], boundary_match_tol, chain_gap_tol)
+            if retry is not None and retry['covers_full']:
+                full_matches[i] = retry
+                break
 
     # Pass 2: everything else, using only what pass 1 left unclaimed.
     results: list[BarLengthResult] = []
@@ -281,7 +324,7 @@ def calculate_bar_lengths(
             results.append(_finish_main_bar(cb, full_matches[i], scale))
         else:
             pb = cb.matched_bar.physical_bar
-            coverage = _find_dimension_coverage(pb.x_left, pb.x_right, available) if pb is not None else None
+            coverage = _find_dimension_coverage(pb.x_left, pb.x_right, available, boundary_match_tol, chain_gap_tol) if pb is not None else None
             results.append(_calculate_main_bar(cb, coverage, scale))
 
     return results
@@ -411,7 +454,10 @@ def _finalize_main_bar(cb: ClassifiedBar, base_length_mm: float, base_note: str)
 
 # ── Dimension-chain reconstruction ────────────────────────────────────────────
 
-def _find_dimension_coverage(bar_x_left: float, bar_x_right: float, zone_dims: list[dict]) -> Optional[dict]:
+def _find_dimension_coverage(
+    bar_x_left: float, bar_x_right: float, zone_dims: list[dict],
+    boundary_match_tol: float = BOUNDARY_MATCH_TOL, chain_gap_tol: float = CHAIN_GAP_TOL,
+) -> Optional[dict]:
     """
     Try to reconstruct a bar's own physical span from this beam's own
     drawn dimensions — main span dims and curtailment/support-bar dims
@@ -430,16 +476,19 @@ def _find_dimension_coverage(bar_x_left: float, bar_x_right: float, zone_dims: l
                         in points (0.0 if covers_full)
         description   : human-readable chain summary, for the note
     """
-    left = _chain_from_left(bar_x_left, bar_x_right, zone_dims)
+    left = _chain_from_left(bar_x_left, bar_x_right, zone_dims, boundary_match_tol, chain_gap_tol)
     if left is not None:
         return left
-    return _chain_from_right(bar_x_left, bar_x_right, zone_dims)
+    return _chain_from_right(bar_x_left, bar_x_right, zone_dims, boundary_match_tol, chain_gap_tol)
 
 
-def _chain_from_left(bar_x_left: float, bar_x_right: float, zone_dims: list[dict]) -> Optional[dict]:
+def _chain_from_left(
+    bar_x_left: float, bar_x_right: float, zone_dims: list[dict],
+    boundary_match_tol: float = BOUNDARY_MATCH_TOL, chain_gap_tol: float = CHAIN_GAP_TOL,
+) -> Optional[dict]:
     candidates = sorted(zone_dims, key=lambda d: d['x_left'])
     for start_idx, d in enumerate(candidates):
-        if abs(d['x_left'] - bar_x_left) > BOUNDARY_MATCH_TOL:
+        if abs(d['x_left'] - bar_x_left) > boundary_match_tol:
             continue
         # A starting dimension that already overshoots the bar's own far
         # edge by itself can't be this bar's own dimension at all — it
@@ -448,18 +497,18 @@ def _chain_from_left(bar_x_left: float, bar_x_right: float, zone_dims: list[dict
         # edge support bar whose left edge coincides with bay 1's own
         # dimension start — "4700" is bay 1's full span, not mark 8's
         # own ~1391mm length, and must never be tried as its start).
-        if d['x_right'] > bar_x_right + BOUNDARY_MATCH_TOL:
+        if d['x_right'] > bar_x_right + boundary_match_tol:
             continue
 
         total, right_edge, used = d['value'], d['x_right'], [d]
         idx = start_idx + 1
         while idx < len(candidates):
-            if abs(right_edge - bar_x_right) <= BOUNDARY_MATCH_TOL:
+            if abs(right_edge - bar_x_right) <= boundary_match_tol:
                 break
             nxt = candidates[idx]
-            if nxt['x_left'] - right_edge > CHAIN_GAP_TOL:
+            if nxt['x_left'] - right_edge > chain_gap_tol:
                 break
-            if nxt['x_left'] < right_edge - CHAIN_GAP_TOL:
+            if nxt['x_left'] < right_edge - chain_gap_tol:
                 idx += 1
                 continue
             # Same overshoot guard applied to each extension step —
@@ -469,14 +518,14 @@ def _chain_from_left(bar_x_left: float, bar_x_right: float, zone_dims: list[dict
             # dimension, but one that fully belongs to mark 19's own
             # chain, not mark 20's) landed within undershoot tolerance
             # and was wrongly accepted as partial coverage.
-            if nxt['x_right'] > bar_x_right + BOUNDARY_MATCH_TOL:
+            if nxt['x_right'] > bar_x_right + boundary_match_tol:
                 break
             total += nxt['value']
             right_edge = nxt['x_right']
             used.append(nxt)
             idx += 1
 
-        covers_full = abs(right_edge - bar_x_right) <= BOUNDARY_MATCH_TOL
+        covers_full = abs(right_edge - bar_x_right) <= boundary_match_tol
         leftover_pt = 0.0 if covers_full else max(0.0, bar_x_right - right_edge)
         return {
             'matched_mm': total, 'covers_full': covers_full, 'leftover_pt': leftover_pt,
@@ -485,35 +534,38 @@ def _chain_from_left(bar_x_left: float, bar_x_right: float, zone_dims: list[dict
     return None
 
 
-def _chain_from_right(bar_x_left: float, bar_x_right: float, zone_dims: list[dict]) -> Optional[dict]:
+def _chain_from_right(
+    bar_x_left: float, bar_x_right: float, zone_dims: list[dict],
+    boundary_match_tol: float = BOUNDARY_MATCH_TOL, chain_gap_tol: float = CHAIN_GAP_TOL,
+) -> Optional[dict]:
     candidates = sorted(zone_dims, key=lambda d: d['x_left'])
     for start_idx in range(len(candidates) - 1, -1, -1):
         d = candidates[start_idx]
-        if abs(d['x_right'] - bar_x_right) > BOUNDARY_MATCH_TOL:
+        if abs(d['x_right'] - bar_x_right) > boundary_match_tol:
             continue
         # Mirror of the left-side overshoot guard above.
-        if d['x_left'] < bar_x_left - BOUNDARY_MATCH_TOL:
+        if d['x_left'] < bar_x_left - boundary_match_tol:
             continue
 
         total, left_edge, used = d['value'], d['x_left'], [d]
         idx = start_idx - 1
         while idx >= 0:
-            if abs(left_edge - bar_x_left) <= BOUNDARY_MATCH_TOL:
+            if abs(left_edge - bar_x_left) <= boundary_match_tol:
                 break
             prv = candidates[idx]
-            if left_edge - prv['x_right'] > CHAIN_GAP_TOL:
+            if left_edge - prv['x_right'] > chain_gap_tol:
                 break
-            if prv['x_right'] > left_edge + CHAIN_GAP_TOL:
+            if prv['x_right'] > left_edge + chain_gap_tol:
                 idx -= 1
                 continue
-            if prv['x_left'] < bar_x_left - BOUNDARY_MATCH_TOL:
+            if prv['x_left'] < bar_x_left - boundary_match_tol:
                 break
             total += prv['value']
             left_edge = prv['x_left']
             used.insert(0, prv)
             idx -= 1
 
-        covers_full = abs(left_edge - bar_x_left) <= BOUNDARY_MATCH_TOL
+        covers_full = abs(left_edge - bar_x_left) <= boundary_match_tol
         leftover_pt = 0.0 if covers_full else max(0.0, left_edge - bar_x_left)
         return {
             'matched_mm': total, 'covers_full': covers_full, 'leftover_pt': leftover_pt,

@@ -97,6 +97,7 @@ class DwgDrawing:
     kinks:                list[RawPolyline] = field(default_factory=list)
     beam_outline_edges:   list[RawPolyline] = field(default_factory=list)
     beam_labels:          list[TextLabel]   = field(default_factory=list)
+    section_labels:       list[TextLabel]   = field(default_factory=list)
     dimensions:           list[RawDimension] = field(default_factory=list)
     leader_shafts:        list[RawPolyline] = field(default_factory=list)
 
@@ -151,6 +152,9 @@ def load_dwg_drawing(dxf_path: str) -> DwgDrawing:
                 dwg.link_labels.append(label)
             elif role == LayerRole.BEAM_LABEL:
                 dwg.beam_labels.append(label)
+
+        elif role == LayerRole.SECTION and etype == "TEXT":
+            dwg.section_labels.append(_as_label(e))
 
         elif role == LayerRole.DIMENSION_LINE and etype == "DIMENSION":
             dim = _as_dimension(e)

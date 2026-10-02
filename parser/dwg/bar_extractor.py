@@ -51,23 +51,13 @@ from parser.geometry.primitives import LineSegment, Point
 
 HOOK_LEG_MIN_LENGTH = 15.0   # vertical rise/fall at an end to call it a hook (mm)
 KINK_SEARCH_TOL = 60.0       # how close a Rebar Kink entity must sit to a bar endpoint (mm)
-ZONE_Y_MARGIN = 300.0
-# A bar polyline's own x-extent occasionally runs slightly past the
-# beam outline's nominal edge (confirmed on Serenity_beams.dxf, FBM 6:
-# up to ~255 units past x_left) — a bar's drawn hook/kink can overshoot
-# the outline box a little. 5.0 was too tight and silently dropped real
-# bars from their own zone; 400 clears the observed overshoot with
-# margin while staying well under inter-beam spacing.
-ZONE_X_MARGIN = 400.0
 
 
 def extract_physical_bars(dwg: DwgDrawing, zone: BeamZone, position: str) -> list[PhysicalBar]:
-    polylines = dwg.bar_lines_top if position == "top" else dwg.bar_lines_bottom
-    in_zone = [
-        p for p in polylines
-        if zone.contains_x(p.x_left, ZONE_X_MARGIN) and zone.contains_x(p.x_right, ZONE_X_MARGIN)
-        and zone.contains_y(p.mid_y, ZONE_Y_MARGIN)
-    ]
+    # Bars are owned by the zone's assembly by construction (see
+    # beam_zones.py) — no margin-based containment test any more, which
+    # is what let neighbouring beams' bars leak into a zone.
+    in_zone = zone.bars_top if position == "top" else zone.bars_bottom
 
     bars: list[PhysicalBar] = []
     for i, poly in enumerate(in_zone):
